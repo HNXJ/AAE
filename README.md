@@ -1,2 +1,2 @@
 # AAE
-Analysis util
+Analysis (Electrophysiology) 
