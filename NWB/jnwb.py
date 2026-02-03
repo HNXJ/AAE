@@ -18,6 +18,10 @@ import matplotlib.pyplot as plt
 import scipy.stats # Added missing import
 import scipy.ndimage as ndimage # Added missing import
 
+import scipy.signal as signal
+import matplotlib.patches as patches
+from matplotlib.colors import Normalize
+
 
 def inspect_h5py_raw_structure(filepath, max_display_elements=5):
     """
@@ -726,4 +730,787 @@ def get_unit_ids_for_area(nwb_file, target_area_name):
 
     # Return the unit IDs as a list
     return filtered_units['id_unit'].tolist()
+
+
+class vFLIP2:
+    """
+    vFLIP2 Analysis Class
+
+    Analyzes electrophysiological data to identify spectrolaminar motifs based on
+    power changes across frequency bands and laminar depth.
+    """
+
+    def __init__(self, data,
+                 intdist=np.nan,
+                 freqbinsize=1.0,
+                 DataType='psd',
+                 fsample=np.nan,
+                 orientation='both',
+                 layer4Thickness=np.nan,
+                 plot_result=False,
+                 omega_cut=6.0):
+
+        # Input Validation
+        if DataType not in ["psd", "raw", "raw_cut"]:
+            raise ValueError("DataType must be 'psd', 'raw', or 'raw_cut'.")
+        if orientation not in ["upright", "inverted", "both"]:
+            raise ValueError("orientation must be 'upright', 'inverted', or 'both'.")
+
+        self.plot_combined = False
+        self.omega_cut = omega_cut
+
+        # Handle inter-channel distance
+        if np.isnan(intdist):
+            try:
+                val = float(input('Please enter the interchannel distance in mm (intdist): '))
+                if val <= 0: raise ValueError
+                self.intdist = val
+            except:
+                raise ValueError('Invalid interchannel distance entered.')
+        else:
+            self.intdist = intdist
+
+        # Setup step sizes
+        self.step = int(round(0.1 / self.intdist))  # search steps on channels
+        self.minrange_s = int(np.ceil(0.3 / self.intdist))
+
+        # Handle Data Input
+        if DataType == "psd":
+            self.nonnormpowmat = data
+            self.freqbinsize = freqbinsize
+        elif DataType in ["raw", "raw_cut"]:
+            if np.isnan(fsample):
+                try:
+                    val = float(input('Please enter the sampling rate (fsample): '))
+                    if val <= 0: raise ValueError
+                    self.fsample = val
+                except:
+                    raise ValueError('Invalid sampling rate entered.')
+            else:
+                self.fsample = fsample
+
+            if DataType == "raw":
+                # Assuming data is (n_chan, n_time)
+                trials = self._split_into_trials(data)
+                self.nonnormpowmat = self._compute_psd_hanning(trials)
+            elif DataType == "raw_cut":
+                # Assuming data is list of arrays or 3D array
+                self.nonnormpowmat = self._compute_psd_hanning(data)
+
+            self.freqbinsize = 1.0
+
+        # Handle NaNs and Row trimming
+        # Check first column for NaNs to determine valid channel range
+        nanboolean = ~np.isnan(self.nonnormpowmat[:, 0])
+        if np.sum(nanboolean) == 0:
+            raise ValueError("Error using FLIPAnalysis: Empty matrix")
+
+        # Find first and last valid row indices
+        valid_indices = np.where(nanboolean)[0]
+        self.startrow = valid_indices[0]
+        self.endrow = valid_indices[-1] # Python index inclusive for logic, careful with slicing
+
+        self.freqaxis = np.arange(1, self.nonnormpowmat.shape[1] + 1) * self.freqbinsize
+
+        # Orientation setup
+        if orientation == 'both':
+            self.orientation1 = 0
+        elif orientation == 'upright':
+            self.orientation1 = 1
+        elif orientation == "inverted":
+            self.orientation1 = -1
+
+        # Layer 4 Thickness
+        # Citation: O'Kusky, J., & Colonnier, M. (1982).
+        laminae_thickness_mm = np.array([122.9, 396.9, 127.1, 211.4, 247.5, 226.3, 260.2]) / 1000.0
+
+        if np.isnan(layer4Thickness):
+            # Sum of indices 2, 3, 4 (IVA, IVB, IVC) -> Python indices 2:5
+            layer4 = np.sum(laminae_thickness_mm[2:5])
+        else:
+            layer4 = layer4Thickness
+
+        self.minrange = int(np.ceil(layer4 / self.intdist))
+
+        # Run Analysis
+        self.Results = self.flip_it()
+        self.relpow = self._get_Window(self.startrow, self.endrow)
+
+        if self.Results is not None and plot_result:
+            self.plot_result()
+
+    # =========================================================================
+    # CORE ANALYSIS METHODS
+    # =========================================================================
+
+    def _get_Window(self, proximalchannel, distalchannel):
+        # Slicing: inclusive of proximal, inclusive of distal (so +1 for Python)
+        powspec_window = self.nonnormpowmat[proximalchannel : distalchannel + 1, :]
+
+        # Max power along freq axis (dim 0 in subarray, which corresponds to channels)
+        # MATLAB: max(A, [], 1) returns row vector of maxes of each column.
+        # Wait, MATLAB: max(powspec_window,[],1) finds max across DIM 1 (channels).
+        # Result is (1, n_freqs).
+        # The code calculates relative power by dividing by max power across the depth for that frequency.
+
+        maxpow = np.max(powspec_window, axis=0)
+
+        # Avoid divide by zero
+        maxpow[maxpow == 0] = np.nan
+
+        relpow = powspec_window / maxpow
+        return relpow
+
+    def _get_freqbands(self, S1_meanpow, S2_meanpow):
+        """
+        Determines deep and superficial frequency bands.
+        """
+        def find_longest_true_run(logical_array):
+            # Pad with 0 to detect edges
+            d = np.diff(np.concatenate(([0], logical_array.astype(int), [0])))
+            run_starts = np.where(d == 1)[0]
+            run_ends = np.where(d == -1)[0] - 1
+            run_lengths = run_ends - run_starts + 1
+
+            if len(run_lengths) > 0:
+                idx = np.argmax(run_lengths)
+                # Return range indices
+                return np.arange(run_starts[idx], run_ends[idx] + 1)
+            else:
+                return np.array([], dtype=int)
+
+        # Boolean masks for frequency ranges
+        lowfreqs = (self.freqaxis > 4) & (self.freqaxis < 70)
+        highfreqs = (self.freqaxis > 40) & (self.freqaxis < 150)
+
+        # Comparisons
+        greater = (S1_meanpow > S2_meanpow)
+        lesser = (S1_meanpow < S2_meanpow)
+
+        longest_run_P1 = find_longest_true_run(greater & lowfreqs)
+        longest_run_P2 = find_longest_true_run(lesser & lowfreqs)
+
+        len_P1 = len(longest_run_P1)
+        len_P2 = len(longest_run_P2)
+
+        deep_f = []
+        sup_f = []
+        orientation = 0
+        ind_high = None
+
+        # Determine dominant low frequency group
+        if len_P1 >= 5 and len_P2 >= 5:
+            freq_range_P1 = self.freqaxis[longest_run_P1]
+            freq_range_P2 = self.freqaxis[longest_run_P2]
+
+            if np.min(freq_range_P1) < np.min(freq_range_P2):
+                deep_f = freq_range_P1
+                orientation = -1
+                ind_high = lesser & highfreqs
+            else:
+                deep_f = freq_range_P2
+                orientation = 1
+                ind_high = greater & highfreqs
+        elif len_P1 >= 5:
+            deep_f = self.freqaxis[longest_run_P1]
+            orientation = -1
+            ind_high = lesser & highfreqs
+        elif len_P2 >= 5:
+            deep_f = self.freqaxis[longest_run_P2]
+            orientation = 1
+            ind_high = greater & highfreqs
+
+        # Determine superficial frequency based on orientation
+        if orientation != 0 and ind_high is not None:
+            # Need indices of freqaxis where ind_high is true
+            longest_run_high = find_longest_true_run(ind_high)
+            if len(longest_run_high) > 0:
+                sup_f = self.freqaxis[longest_run_high]
+                if len(sup_f) < 20 or sup_f[-1] < 70:
+                    sup_f = []
+            else:
+                sup_f = []
+
+        # Convert empty numpy arrays to empty lists or None for consistency if needed,
+        # but maintaining numpy array is usually better for indexing later.
+        if len(deep_f) == 0: deep_f = []
+        if len(sup_f) == 0: sup_f = []
+
+        return deep_f, sup_f, orientation
+
+    def _peak_check(self, band, proximalchannel, distalchannel):
+        # Find indices where band is max
+        peak_locations = np.where(band == np.max(band))[0]
+
+        if len(peak_locations) == 0: return False
+
+        if np.mean(peak_locations) > len(band) / 2:
+            peak_index = np.max(peak_locations)
+        else:
+            peak_index = np.min(peak_locations)
+
+        # Check boundary conditions and local maxima
+        # Note: Python indices 0 to len-1
+        if peak_index == 0:
+            # proximalchannel == self.startrow check
+            is_edge = (proximalchannel == self.startrow)
+            is_decreasing = (band[peak_index] > band[peak_index + 1])
+            peak_max_check = is_edge and is_decreasing
+        elif peak_index == len(band) - 1:
+            is_edge = (distalchannel == self.endrow)
+            is_increasing = (band[peak_index] > band[peak_index - 1])
+            peak_max_check = is_edge and is_increasing
+        else:
+            peak_max_check = (band[peak_index] > band[peak_index + 1]) and \
+                             (band[peak_index] > band[peak_index - 1])
+
+        n = len(band)
+        # MATLAB: idx <= minrange_s OR idx >= n - (minrange_s - 1)
+        # Note: MATLAB 1-based, Python 0-based
+        # idx (matlab) = peak_index + 1
+        # check1: (peak_index + 1 <= minrange_s) ...
+
+        # Simplified logic for Python indices:
+        # Check if peak is within the buffer zones at edges
+        # minrange_s is a scalar count
+
+        check1 = (peak_index < self.minrange_s) or (peak_index >= n - self.minrange_s)
+
+        return peak_max_check and check1
+
+    def _crossover_channels(self, lowband, highband, proximalchannel, orientation):
+        band_diff = np.abs(highband - lowband)
+        n = len(lowband)
+
+        crossoverchannels = []
+
+        # Inner helper logic
+        def determine_cross(idx):
+            # idx corresponds to Python index 0...n-3
+            # Accessing idx, idx+1, idx+2
+
+            b1 = highband if orientation > 0 else lowband
+            b2 = lowband if orientation > 0 else highband
+
+            # Condition 1: Direct Cross
+            # b1[i] > b2[i] AND b2[i+1] > b1[i+1]
+            if b1[idx] > b2[idx] and b2[idx+1] > b1[idx+1]:
+                if abs(band_diff[idx]) <= abs(band_diff[idx+1]):
+                    return idx
+                else:
+                    return idx + 1
+
+            # Condition 2: Plateau Cross
+            # b1[i] > b2[i] AND b1[i+1] == b2[i+1] AND b2[i+2] > b1[i+2]
+            # Ensure idx+2 exists
+            if idx + 2 < len(b1):
+                if b1[idx] > b2[idx] and b1[idx+1] == b2[idx+1] and b2[idx+2] > b1[idx+2]:
+                    return idx + 1
+
+            return np.nan
+
+        # Loop through channels (up to n-2 to allow for i+1 check, logic handles i+2 internally)
+        for i in range(n - 1):
+            res = determine_cross(i)
+            if not np.isnan(res):
+                crossoverchannels.append(res)
+
+        crossoverchannels = np.array(crossoverchannels)
+
+        if len(crossoverchannels) == 0:
+            return np.nan
+        elif len(crossoverchannels) == 1:
+            # Convert relative channel index to absolute channel index
+            return crossoverchannels[0] + proximalchannel # +1? No, indices align.
+        else:
+            # Multiple crosses, find the best one based on area difference
+            ratings = []
+            for cross_idx in crossoverchannels:
+                cross_idx_int = int(cross_idx)
+                # Sum differences before and after
+                # Python slicing: 0:cross_idx includes up to cross_idx-1
+                # MATLAB: 1:crossover_choice
+
+                # Careful: The crossover index returned represents a specific channel.
+                # The area calculation should split at that channel.
+
+                # MATLAB: sum(diff(1:cross)) - sum(diff(cross:end))
+                diff_sum_pre = np.sum(band_diff[:cross_idx_int+1])
+                diff_sum_post = np.sum(band_diff[cross_idx_int:])
+
+                ratings.append(diff_sum_pre - diff_sum_post)
+
+            best_idx = np.argmax(ratings)
+            return crossoverchannels[best_idx] + proximalchannel
+
+    def _evaluate_individual_goodness(self, lowband, highband):
+        set_pval = 0.05
+
+        def BandRegress(band):
+            n = len(band)
+            x = np.arange(1, n + 1)
+            # Polyfit degree 2: p[0]x^2 + p[1]x + p[2]
+            p, residuals, _, _, _ = np.polyfit(x, band, 2, full=True)
+
+            # Calculate R-squared
+            y_pred = np.polyval(p, x)
+            sst = np.sum((band - np.mean(band))**2)
+            sse = np.sum((band - y_pred)**2)
+            rsquared = 1 - (sse / sst) if sst != 0 else 0
+
+            # Calculate p-value (approximate for polyfit)
+            # Using F-statistic approach for model significance
+            dof_model = 2
+            dof_resid = n - (dof_model + 1)
+            if dof_resid > 0 and sse > 0:
+                msr = (sst - sse) / dof_model
+                mse = sse / dof_resid
+                f_stat = msr / mse
+                # To avoid strict dependency on scipy.stats if not strictly needed,
+                # but we imported scipy. let's use it implicitly or simplify.
+                # Implementing simple check or assuming scipy available:
+                pval = 1 - scipy.stats.f.cdf(f_stat, dof_model, dof_resid)
+            else:
+                pval = 1.0 # Not significant
+
+            midpoint = np.round(n / 2)
+            slope = 2 * p[0] * midpoint + p[1] # Derivative at midpoint
+            return slope, rsquared, pval
+
+        low_slope, low_r2, low_pval = BandRegress(lowband)
+        high_slope, high_r2, high_pval = BandRegress(highband)
+
+        goodness = high_r2 * low_r2
+        significant = (low_pval < set_pval) and (high_pval < set_pval)
+
+        if low_slope > 0 and high_slope < 0:
+            Gsign = 1
+        elif low_slope < 0 and high_slope > 0:
+            Gsign = -1
+        else:
+            Gsign = 0
+
+        return goodness * significant * Gsign
+
+    def omega_fun(self):
+        euc_distance = lambda g1, g2: np.sqrt(np.sum((g1 - g2)**2))
+
+        best_split = np.full(12, np.nan)
+        best_omega = -np.inf
+
+        # Iterate Proximal
+        # MATLAB: startrow : step : (endrow - minrange + 1)
+        # Python range excludes stop, so we add logic
+        prox_start = self.startrow
+        prox_end = self.endrow - self.minrange + 1
+
+        for proximalchannel in range(prox_start, prox_end + 1, self.step):
+
+            # Iterate Distal
+            dist_start = proximalchannel + self.minrange
+            dist_end = self.endrow
+
+            for distalchannel in range(dist_start, dist_end + 1, self.step):
+
+                psd_normalized = self._get_Window(proximalchannel, distalchannel)
+
+                # Determine local minrange_s
+                self.minrange_s = int(np.floor(abs(proximalchannel - distalchannel) / 2))
+                if self.minrange_s < 1: continue
+
+                # Groups for freq band determination
+                group1 = psd_normalized[:self.minrange_s, :]
+                group2 = psd_normalized[-(self.minrange_s):, :] # Check indexing logic
+
+                # Moving mean smoothing (window 5)
+                # MATLAB smoothdata default is moving average.
+                S1_meanpow = np.mean(group1, axis=0)
+                S2_meanpow = np.mean(group2, axis=0)
+
+                S1_meanpow = ndimage.uniform_filter1d(S1_meanpow, size=5)
+                S2_meanpow = ndimage.uniform_filter1d(S2_meanpow, size=5)
+
+                Ps_dist = euc_distance(S1_meanpow, S2_meanpow)
+
+                deep_f, sup_f, orientation = self._get_freqbands(S1_meanpow, S2_meanpow)
+
+                if len(deep_f) == 0 or len(sup_f) == 0:
+                    continue
+
+                # Indices for deep and sup freqs.
+                # self.freqaxis contains the actual Hz. We need indices.
+                # deep_f contains Hz values.
+                # Assuming freqaxis matches indices 1-to-1 shifted by binsize if simple,
+                # but better to find indices using searchsorted or isin if exact match.
+                # Given construction: freqaxis = 1:size * binsize.
+
+                # Logical masking to get bands from psd_normalized
+                deep_mask = np.isin(self.freqaxis, deep_f)
+                sup_mask = np.isin(self.freqaxis, sup_f)
+
+                lowband = np.mean(psd_normalized[:, deep_mask], axis=1)
+                highband = np.mean(psd_normalized[:, sup_mask], axis=1)
+
+                band_dist = euc_distance(lowband, highband)
+                goodness = self._evaluate_individual_goodness(lowband, highband)
+
+                # Orientation check logic
+                if self.orientation1 == -1 and goodness > 0:
+                    goodness = 0
+                elif self.orientation1 == 1 and goodness < 0:
+                    goodness = 0
+
+                omega = np.log(Ps_dist * band_dist * abs(goodness) * \
+                               abs(proximalchannel - distalchannel) * \
+                               len(deep_f) * len(sup_f))
+
+                # Markers relative to the window
+                # find(..., 1) returns first index
+                high_max_idx = np.argmax(highband)
+                low_max_idx = np.argmax(lowband)
+
+                # Convert relative to absolute
+                highfreqmaxchannel = high_max_idx + proximalchannel
+                lowfreqmaxchannel = low_max_idx + proximalchannel
+
+                crossover_point = self._crossover_channels(lowband, highband, proximalchannel, orientation)
+
+                # Conditions
+                adequate_difference = (omega != 0) and not np.isinf(omega)
+                check_lowpeak = self._peak_check(lowband, proximalchannel, distalchannel)
+                check_highpeak = self._peak_check(highband, proximalchannel, distalchannel)
+                check_peak_dist = abs(highfreqmaxchannel - lowfreqmaxchannel) >= self.minrange
+                valid_crossover = not np.isnan(crossover_point)
+
+                good_arrangement = (
+                    (lowfreqmaxchannel < crossover_point < highfreqmaxchannel) or
+                    (lowfreqmaxchannel > crossover_point > highfreqmaxchannel)
+                )
+
+                non_overlap = (lowfreqmaxchannel != crossover_point) and \
+                              (crossover_point != highfreqmaxchannel) and \
+                              (lowfreqmaxchannel != highfreqmaxchannel)
+
+                good_fit = adequate_difference and check_lowpeak and check_highpeak and \
+                           valid_crossover and good_arrangement and non_overlap and check_peak_dist
+
+                if good_fit and (omega > best_omega):
+                    best_split = [
+                        goodness,
+                        deep_f[0], deep_f[-1],
+                        sup_f[0], sup_f[-1],
+                        proximalchannel, distalchannel,
+                        lowfreqmaxchannel, highfreqmaxchannel,
+                        crossover_point, omega, orientation
+                    ]
+                    best_omega = omega
+
+        # Frequencies are already in Hz from get_freqbands logic,
+        # but the MATLAB code multiplies indices by binsize at the end.
+        # My _get_freqbands returns actual freq values, so no multiplication needed here.
+        # However, to match MATLAB output structure exactly:
+        return best_omega, best_split
+
+    def flip_it(self):
+        best_omega, best_split = self.omega_fun()
+
+        if best_omega <= self.omega_cut:
+            return None
+        else:
+            fields = ['goodnessvalue', 'startinglowfreq', 'endinglowfreq',
+                      'startinghighfreq', 'endinghighfreq', 'proximalchannel',
+                      'distalchannel', 'lowfreqmaxchannel', 'highfreqmaxchannel',
+                      'crossoverchannel', 'omega', 'orientation']
+
+            results = {}
+            for i, field in enumerate(fields):
+                results[field] = best_split[i]
+
+            # Map struct-like object
+            class ResultsStruct:
+                def __init__(self, **entries):
+                    self.__dict__.update(entries)
+                    self.relpow = None
+
+            return ResultsStruct(**results)
+
+    # =========================================================================
+    # SIGNAL PROCESSING
+    # =========================================================================
+
+    def _split_into_trials(self, data):
+        # data: (n_channels, n_timepoints)
+        trial_duration_sec = 1
+        samples_per_trial = int(trial_duration_sec * self.fsample)
+        n_channels, total_timepoints = data.shape
+        num_trials = total_timepoints // samples_per_trial
+
+        # Crop data to full trials
+        cutoff = num_trials * samples_per_trial
+        data_crop = data[:, :cutoff]
+
+        # Reshape: (n_channels, samples_per_trial, num_trials)
+        # MATLAB reshape fills columns first.
+        # We want to split time axis.
+        # Reshape to (n_channels, num_trials, samples_per_trial) then transpose?
+        # Actually easier to use np.split or reshape logic.
+
+        # Make (n_channels, num_trials, samples)
+        reshaped = data_crop.reshape(n_channels, num_trials, samples_per_trial)
+
+        # Return as list of (n_channels, samples) arrays to mimic cell array
+        trials = [reshaped[:, i, :] for i in range(num_trials)]
+        return trials
+
+    def _compute_psd_hanning(self, data):
+        # Data is list of (n_chan, n_sample) arrays or a 3D array (n_trial, n_chan, n_sample)
+        # Note: MATLAB code input signature for raw_cut is (n, m, p) -> (chan, time, trial)
+
+        is_list = isinstance(data, list)
+
+        if is_list:
+            ntrials = len(data)
+            nchan = data[0].shape[0]
+            ndatsamples = [d.shape[1] for d in data]
+            max_ndatsample = max(ndatsamples)
+        else:
+            # Assumes (n_chan, n_time, n_trial) based on MATLAB reshape logic
+            # But usually Python standard is (n_trial, n_chan, n_time).
+            # Let's align with MATLAB reshape output: (nchan, samples, trials)
+            # Actually my _split_into_trials outputs list.
+            # If "raw_cut" is passed as array, assume (nchan, time, trials)
+            nchan, max_ndatsample, ntrials = data.shape
+
+        # Padding
+        padding_len = int(2**np.ceil(np.log2(max_ndatsample)))
+        pad_factor = padding_len / self.fsample
+        endnsample = int(round(pad_factor * self.fsample))
+
+        # Freqs of interest (1 to 150)
+        foi = np.arange(1, 151)
+        fboi = np.round(foi * pad_factor).astype(int) + 1 # MATLAB 1-based index logic
+        # Python FFT freq indices: 0 is DC.
+        # fboi in MATLAB maps to FFT bins.
+
+        # Re-calc standard FFT bins
+        freqs = np.fft.rfftfreq(endnsample, d=1/self.fsample)
+
+        # Find indices closest to FOI
+        # MATLAB logic creates specific indices. Let's replicate logic precisely.
+        # MATLAB: fboi = round(foi * pad) + 1;
+        # In Python index = round(foi * pad).
+        # Because FFT[0] is 0Hz. FFT[1] is 1/(pad*fs) approx.
+        freq_indices = np.round(foi * pad_factor).astype(int)
+
+        # Setup output
+        powspctrm = np.zeros((ntrials, nchan, len(freq_indices)))
+
+        for itrial in range(ntrials):
+            if is_list:
+                dat = data[itrial]
+            else:
+                dat = data[:, :, itrial]
+
+            n_chan_trial, ndatsample = dat.shape
+
+            # Detrend (MATLAB code: dat - beta*x where x is ones -> subtracting mean)
+            dat = dat - np.mean(dat, axis=1, keepdims=True)
+
+            # Hanning Taper
+            tap = np.hanning(ndatsample)
+            tap = tap / np.linalg.norm(tap)
+
+            # Apply Taper
+            data_tap = dat * tap[np.newaxis, :]
+
+            # Zero Pad
+            postpad = endnsample - ndatsample
+            if postpad > 0:
+                data_tap_pad = np.pad(data_tap, ((0,0), (0, postpad)), 'constant')
+            else:
+                data_tap_pad = data_tap
+
+            # FFT
+            # MATLAB: fft(X, [], 2). Python: np.fft.fft(X, axis=1)
+            dum = np.fft.fft(data_tap_pad, axis=1)
+
+            # Extract Frequencies
+            # MATLAB indices fboi. Python indices fboi-1 (since we did +1 in comment before)
+            # Actually freq_indices calculated above should be correct for 0-based.
+            dum = dum[:, freq_indices]
+
+            # Phase correction (timedelay) - omitted for brevity as timedelay=time(1)
+            # and usually time starts at 0 for trials.
+            # In MATLAB code: time = time_step:time_step:ntrialtime.
+            # So timedelay = 1/fsample.
+            # If strictly replicating:
+            timedelay = 1.0 / self.fsample
+            if timedelay != 0:
+                angletransform = np.zeros(len(freq_indices), dtype=complex)
+                missedsamples = round(timedelay * self.fsample) # should be 1
+                anglein = missedsamples * (2 * np.pi / self.fsample) * foi
+                # e^(-i * angle)
+                # MATLAB: atan2 logic.
+                # Simplification: Apply phase shift
+                phase_shift = np.exp(-1j * anglein)
+                dum = dum * phase_shift[np.newaxis, :]
+
+            # Scale
+            dum = dum * np.sqrt(2 / endnsample)
+
+            # Power
+            powspctrm[itrial, :, :] = np.abs(dum)**2
+
+        nonnormpow = powspctrm
+        meanpow = np.mean(nonnormpow, axis=0) # Average over trials
+        return meanpow
+
+    # =========================================================================
+    # PLOTTING
+    # =========================================================================
+
+    def plot_relpowMap(self, ax, plot_SLonly=False):
+        if self.Results is None:
+            print("No results to plot.")
+            return
+
+        if not plot_SLonly:
+            start_idx = self.Results.proximalchannel
+            end_idx = self.Results.distalchannel
+            # Slice inclusive
+            window_data = self.nonnormpowmat[start_idx : end_idx + 1, :]
+            max_sp = np.max(window_data, axis=0)
+            max_sp[max_sp == 0] = np.nan
+            relpow1 = self.nonnormpowmat / max_sp
+
+            s_chan = self.startrow
+            e_chan = self.endrow
+
+            # Crop relpow1 to valid analysis range for display
+            # MATLAB: imagesc(relpow1) where relpow1 is the WHOLE matrix normalized by the window max?
+            # Re-reading MATLAB:
+            # relpow1 = squeeze(obj.nonnormpowmat)./max_sp;
+            # It normalizes the ENTIRE matrix by the max power found in the PROX-DIST window.
+            img_data = relpow1[s_chan : e_chan + 1, :]
+
+        else:
+            s_chan = self.Results.proximalchannel
+            e_chan = self.Results.distalchannel
+            relpow1 = self._get_Window(s_chan, e_chan)
+            img_data = relpow1
+
+        self.Results.relpow = img_data # Store for consistency
+
+        im = ax.imshow(img_data, aspect='auto', cmap='jet',
+                       extent=[self.freqaxis[0], self.freqaxis[-1], e_chan, s_chan])
+        # Note: extent Y is top, bottom. standard imagesc puts low index at top.
+
+        ax.set_title('LFP Relative Power')
+        ax.set_xlabel('Frequency (Hz)')
+        ax.set_ylabel('Channel Number')
+
+        # Colorbar
+        plt.colorbar(im, ax=ax, label='Relative Power')
+        im.set_clim(0.3, 1.0) # Matches setcb logic
+
+        self._plot_freqran(ax)
+        self._plot_physMarkers(ax, self.freqaxis[-1], plot_SLonly)
+
+    def plot_bandedrelpow(self, ax, plot_SLonly=False):
+        if self.Results is None: return
+
+        if not plot_SLonly:
+            start_idx = self.Results.proximalchannel
+            end_idx = self.Results.distalchannel
+            window_data = self.nonnormpowmat[start_idx : end_idx + 1, :]
+            max_sp = np.max(window_data, axis=0)
+            max_sp[max_sp == 0] = np.nan
+            relpow1 = self.nonnormpowmat / max_sp
+
+            s_chan = self.startrow
+            e_chan = self.endrow
+            plot_data = relpow1[s_chan : e_chan + 1, :]
+        else:
+            s_chan = self.Results.proximalchannel
+            e_chan = self.Results.distalchannel
+            plot_data = self._get_Window(s_chan, e_chan)
+
+        # Get indices for bands
+        # self.Results.startinglowfreq is in Hz. Convert to indices.
+        # Assuming freqbinsize = 1, indices roughly match Hz-1.
+        # Using searchsorted for robustness.
+        l_start = np.searchsorted(self.freqaxis, self.Results.startinglowfreq)
+        l_end = np.searchsorted(self.freqaxis, self.Results.endinglowfreq)
+        h_start = np.searchsorted(self.freqaxis, self.Results.startinghighfreq)
+        h_end = np.searchsorted(self.freqaxis, self.Results.endinghighfreq)
+
+        lowband = np.mean(plot_data[:, l_start : l_end + 1], axis=1)
+        highband = np.mean(plot_data[:, h_start : h_end + 1], axis=1)
+
+        channels = np.arange(s_chan, e_chan + 1)
+
+        ax.plot(lowband, channels, 'b', linewidth=2, label='Low Band')
+        ax.plot(highband, channels, 'r', linewidth=2, label='High Band')
+        ax.invert_yaxis()
+        ax.set_xlim(0, 1)
+        ax.set_xlabel('Relative Power')
+        ax.set_ylabel('Channel Number')
+
+        self._plot_physMarkers(ax, 1, plot_SLonly)
+
+        if not plot_SLonly:
+            # Yellow patch for regression range
+            rect = patches.Rectangle((0.95, self.Results.proximalchannel),
+                                     0.05,
+                                     self.Results.distalchannel - self.Results.proximalchannel,
+                                     linewidth=0, facecolor='yellow', alpha=0.5)
+            ax.add_patch(rect)
+
+        ax.legend()
+
+    def _plot_freqran(self, ax):
+        yl = ax.get_ylim()
+        for f in [self.Results.startinglowfreq, self.Results.endinglowfreq]:
+            ax.vlines(f, yl[0], yl[1], colors='b', linestyles='--')
+        for f in [self.Results.startinghighfreq, self.Results.endinghighfreq]:
+            ax.vlines(f, yl[0], yl[1], colors='r', linestyles='--')
+
+    def _plot_physMarkers(self, ax, textpos, plot_SLonly):
+        if not plot_SLonly:
+            cross = self.Results.crossoverchannel
+            low = self.Results.lowfreqmaxchannel
+            high = self.Results.highfreqmaxchannel
+        else:
+            cross = self.Results.crossoverchannel - self.Results.proximalchannel
+            low = self.Results.lowfreqmaxchannel - self.Results.proximalchannel
+            high = self.Results.highfreqmaxchannel - self.Results.proximalchannel
+            # Offset textpos for local plot if needed, but logic usually implies abs coords
+
+        xlims = ax.get_xlim()
+
+        ax.hlines(cross, xlims[0], xlims[1], colors='k', linestyles='-.', linewidth=0.5)
+        ax.text(textpos, cross, 'Crossover', va='bottom', ha='right', fontsize=8)
+
+        ax.hlines(low, xlims[0], xlims[1], colors='k', linestyles='-.', linewidth=0.5)
+        ax.text(textpos, low, 'Alpha/Beta Peak', va='bottom', ha='right', fontsize=8)
+
+        ax.hlines(high, xlims[0], xlims[1], colors='k', linestyles='-.', linewidth=0.5)
+        ax.text(textpos, high, 'Gamma Peak', va='bottom', ha='right', fontsize=8)
+
+    def plot_result(self, plot_SLonly=False):
+        if self.Results is None: return
+
+        fig = plt.figure(figsize=(12, 6))
+        gs = fig.add_gridspec(1, 3)
+
+        ax1 = fig.add_subplot(gs[0, :2])
+        self.plot_relpowMap(ax1, plot_SLonly)
+
+        ax2 = fig.add_subplot(gs[0, 2], sharey=ax1)
+        self.plot_bandedrelpow(ax2, plot_SLonly)
+
+        t = f'G = {self.Results.goodnessvalue:.4f}, Omega = {self.Results.omega:.4f}'
+        fig.suptitle(f'vFLIP2 Results: {t}')
+        plt.tight_layout()
+        plt.show()
 
