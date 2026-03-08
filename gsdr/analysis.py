@@ -14,6 +14,8 @@ def detect_spikes(neuron_trace, threshold=-20.0):
 
 def calculate_firing_rates(traces, dt, threshold=-20.0):
     """Computes firing rates (Hz) for a batch of traces (Batch, Cells, Time)."""
+    if traces.ndim == 2: # Single batch
+        traces = traces[None, ...]
     num_batches, num_cells, num_timepoints = traces.shape
     duration_s = (num_timepoints * dt) / 1000.0
     
@@ -70,6 +72,46 @@ def compute_correlations(traces, pre_inds, post_inds):
     
     # Square correlation to get mutual information proxy
     return jnp.mean(num**2 / (den + 1e-6), axis=0)
+
+def calculate_mcdp(traces, ampa_pre_inds, ampa_post_inds, gaba_pre_inds, gaba_post_inds):
+    """
+    Calculates normalized MCDP factors for all trainable parameters.
+    """
+    r_ampa = compute_correlations(traces, ampa_pre_inds, ampa_post_inds)
+    r_gaba = compute_correlations(traces, gaba_pre_inds, gaba_post_inds)
+
+    r_ampa_norm = (r_ampa - jnp.mean(r_ampa)) / (jnp.std(r_ampa) + 1e-6) if r_ampa.size > 0 else jnp.array([])
+    r_gaba_norm = (r_gaba - jnp.mean(r_gaba)) / (jnp.std(r_gaba) + 1e-6) if r_gaba.size > 0 else jnp.array([])
+
+    return [{'gAMPA': r_ampa_norm}, {'gGABAa': r_gaba_norm}]
+
+def compute_kappa(spike_matrix, fs, bin_size_ms=5.0):
+    """
+    Computes Fleiss' Kappa for inter-neuron synchrony.
+    Input: (Cells, Time) binary matrix.
+    """
+    N, T = spike_matrix.shape
+    samples_per_bin = jnp.maximum(1, int(fs * (bin_size_ms / 1000.0)))
+    num_bins = T // samples_per_bin
+    
+    if num_bins == 0:
+        return 0.0
+    
+    # Binning (max spike in bin)
+    binned = spike_matrix[:, :num_bins * samples_per_bin].reshape(N, num_bins, samples_per_bin).max(axis=2)
+    
+    spikes_per_bin = binned.sum(axis=0)
+    silences_per_bin = N - spikes_per_bin
+    
+    # P_i: relative observed agreement in bin i
+    P_i = (spikes_per_bin * (spikes_per_bin - 1) + silences_per_bin * (silences_per_bin - 1)) / (N * (N - 1) + 1e-6)
+    P_o = jnp.mean(P_i)
+    
+    # P_e: relative agreement expected by chance
+    p_spike = jnp.sum(spikes_per_bin) / (N * num_bins + 1e-6)
+    P_e = (p_spike**2) + ((1 - p_spike)**2)
+    
+    return (P_o - P_e) / (1.0 - P_e + 1e-6)
 
 def plot_full_simulation_summary(recorded_voltages, time_axis, dt_global,
                                  spike_threshold=-20.0,
