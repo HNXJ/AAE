@@ -5,6 +5,7 @@ import optax
 import numpy as np
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from .analysis import calculate_firing_rates, compute_psd, calculate_mcdp, calculate_psd_bands, compute_unscaled_psd_from_trace, compute_kappa
+from .simulation import noise_current_ac
 
 def get_loss_fn(net, transform, dt_global, global_psd_interval, 
                 lower_c, upper_c, firing_rate_weight, psd_weight,
