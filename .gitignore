@@ -1,0 +1,23 @@
+# Ignore data files and large files
+*.npy
+*.csv
+*.h5
+*.hdf5
+*.mat
+*.zip
+*.tar.gz
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.pdf
+.DS_Store
+
+# Ignore script files (if you only want to push functions/classes, you might want to selectively ignore scripts)
+# For now, ignoring common script patterns or specific directories if needed.
+# *.ipynb
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
