@@ -19,7 +19,9 @@ def get_loss_fn(net, transform, dt_global, global_psd_interval,
             spect=jnp.array([120.0]), delta_t=dt_global, t_max=1500.0
         )
         net.delete_stimuli()
+        net.delete_recordings()
         data_stimuli = net.cell(list(range(0, num_e, 2))).branch(1).loc(0.0).data_stimulate(ac_currents)
+        net.cell("all").branch(0).loc(0.0).record()
         return jx.integrate(net, params=params, data_stimuli=data_stimuli, checkpoint_lengths=checkpoints)
 
     batched_simulate = jax.vmap(simulate_wrapper, in_axes=(None, 0))
