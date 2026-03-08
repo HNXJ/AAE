@@ -63,11 +63,15 @@ def get_loss_fn(net, transform, dt_global, global_psd_interval,
 
 def train_net(net, optimizer, transform, dataloader, loss_fn, 
               ampa_pre_inds, ampa_post_inds, gaba_pre_inds, gaba_post_inds,
-              dt_global, band_definitions, epoch_n=100):
+              dt_global, band_definitions, epoch_n=100, initial_params=None):
     """
     Main training loop for the NetEIG model using GSDR.
     """
-    opt_params = net.get_parameters()
+    if initial_params is None:
+        opt_params = net.get_parameters()
+    else:
+        opt_params = initial_params
+        
     opt_state = optimizer.init(opt_params)
     key = jax.random.PRNGKey(0)
     jitted_grad = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
