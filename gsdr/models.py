@@ -71,10 +71,13 @@ class GradedGABAa(jx.synapses.Synapse):
         return {"sGABAa": s + d_s * dt}
     def compute_current(self, states, pre_v, post_v, params): return params["gGABAa"] * states["sGABAa"] * (post_v - params["EGABAa"])
 
-def build_net_eig(num_e: int, num_ig: int, num_il: int):
+def build_net_eig(num_e: int, num_ig: int, num_il: int, seed: int = 42):
     """
     Constructs a JAXley neural network with specified numbers of excitatory and inhibitory neurons.
+    Uses a fixed seed for reproducible connectivity.
     """
+    np.random.seed(seed) # Set numpy seed for connectivity
+    
     comp = jx.Compartment()
     branch = jx.Branch(comp, ncomp=2)
 
@@ -109,6 +112,6 @@ def build_net_eig(num_e: int, num_ig: int, num_il: int):
     key_conn = jax.random.PRNGKey(1)
     selected_post_indices = np.array(jax.random.choice(key_conn, posts_pool_indices, shape=(num_posts_to_select,), replace=False))
     post_il = net.cell(selected_post_indices).branch(1).loc(1.0)
-    fully_connect(pre_il, post_il, GradedGABAa(tauD_GABAa=2.0))
+    fully_connect(pre_il, post_il, GradedGABAa(tauD_GABAa=5.0)) # Increased to 5.0ms
 
     return net
