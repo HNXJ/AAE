@@ -71,11 +71,13 @@ class GradedGABAa(jx.synapses.Synapse):
         return {"sGABAa": s + d_s * dt}
     def compute_current(self, states, pre_v, post_v, params): return params["gGABAa"] * states["sGABAa"] * (post_v - params["EGABAa"])
 
-def build_net_eig(num_e: int, num_ig: int, num_il: int, seed: int = 42):
+def build_net_eig(num_e: int, num_ig: int, num_il: int, seed: Optional[int] = None):
     """
     Constructs a JAXley neural network with specified numbers of excitatory and inhibitory neurons.
-    Uses a fixed seed for reproducible connectivity.
+    If seed is None, a random seed is generated for connectivity.
     """
+    if seed is None:
+        seed = int(np.random.randint(0, 2**31 - 1))
     np.random.seed(seed) # Set numpy seed for connectivity
     
     comp = jx.Compartment()
@@ -103,15 +105,17 @@ def build_net_eig(num_e: int, num_ig: int, num_il: int, seed: int = 42):
     # Ig -> all (GABAa)
     pre = net.cell([ik for ik in range(num_e, num_e+num_ig)]).branch(0).loc(0.0)
     post = net.cell([ik for ik in range(num_e+num_ig+num_il)]).branch(1).loc(1.0)
-    fully_connect(pre, post, GradedGABAa(tauD_GABAa=5.0))
+    fully_connect(pre, post, GradedGABAa(g=5.0, tauD_GABAa=5.0))
 
     # Il -> subset of all (GABAa)
     pre_il = net.cell([ik for ik in range(num_e+num_ig, num_e+num_ig+num_il)]).branch(0).loc(0.0)
     num_posts_to_select = int((num_e+num_ig+num_il)*0.1)
     posts_pool_indices = jnp.arange(0, num_e + num_ig + num_il)
-    key_conn = jax.random.PRNGKey(1)
+    
+    # Randomize connectivity key using the main seed
+    key_conn = jax.random.PRNGKey(seed)
     selected_post_indices = np.array(jax.random.choice(key_conn, posts_pool_indices, shape=(num_posts_to_select,), replace=False))
     post_il = net.cell(selected_post_indices).branch(1).loc(1.0)
-    fully_connect(pre_il, post_il, GradedGABAa(tauD_GABAa=5.0)) # Increased to 5.0ms
+    fully_connect(pre_il, post_il, GradedGABAa(g=5.0, tauD_GABAa=5.0)) # Increased to 5.0ms
 
     return net

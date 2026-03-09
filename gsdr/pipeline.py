@@ -89,7 +89,8 @@ def train_net(net, optimizer, transform, dataloader, loss_fn,
         opt_params = initial_params
         
     opt_state = optimizer.init(opt_params)
-    key = jax.random.PRNGKey(0)
+    seed = int(np.random.randint(0, 2**31 - 1))
+    key = jax.random.PRNGKey(seed)
     jitted_grad = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
 
     training_log = {k: [] for k in ["loss", "alpha", "avg_gAMPA", "avg_gGABAa", "gamma", "beta", "alpha_band", "theta"]}

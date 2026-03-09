@@ -9,7 +9,7 @@ def noise_current(
     i_amp: float,
     delta_t: float,
     t_max: float,
-    seed: int = 0, 
+    seed: Optional[int] = None, 
     noise_standard_deviation: Optional[float] = None, 
     noise_correlation_tau: Optional[float] = None, 
     noise_mean: Optional[float] = None
@@ -21,6 +21,8 @@ def noise_current(
     if noise_correlation_tau is None: noise_correlation_tau = 10.0
     if noise_mean is None: noise_mean = 0.1
 
+    if seed is None:
+        seed = int(np.random.randint(0, 2**31 - 1))
     key = jax.random.PRNGKey(seed)
     num_steps = int(t_max / delta_t) + 1
     time_axis_array = jnp.arange(0, t_max + delta_t, delta_t)
@@ -59,7 +61,7 @@ def step_current(i_delay: float, i_dur: float, i_amp: float, delta_t: float, t_m
 
 def noise_current_ac(
     i_delay: float, i_dur: float, amp_n: float, amp_b: float, 
-    spect: jnp.ndarray, delta_t: float, t_max: float, seed: int = 0
+    spect: jnp.ndarray, delta_t: float, t_max: float, seed: Optional[int] = None
 ) -> jnp.ndarray:
     """Generates combined OU noise and AC sinusoidal waves."""
     num_steps = int(t_max / delta_t) + 1
