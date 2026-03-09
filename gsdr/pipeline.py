@@ -11,7 +11,7 @@ def get_loss_fn(net, transform, dt_global, global_psd_interval,
                 lower_c, upper_c, firing_rate_weight, psd_weight,
                 num_e, checkpoints, kappa_weight=100.0):
     """
-    Returns a configured loss function targeting 40Hz Gamma and minimal Kappa.
+    Returns a configured loss function targeting Gamma during stim, 1/f off-stim, and minimal overall Kappa.
     """
     def simulate_wrapper(params, input_amp):
         ac_currents = noise_current_ac(
@@ -27,30 +27,46 @@ def get_loss_fn(net, transform, dt_global, global_psd_interval,
     batched_simulate = jax.vmap(simulate_wrapper, in_axes=(None, 0))
 
     def loss_fn(opt_params, inputs, labels):
+        # labels should now contain [target_stim, target_off]
+        target_stim = labels[:, 0, :]
+        target_off = labels[:, 1, :]
+
         params = transform.forward(opt_params)
         traces = batched_simulate(params, inputs)
         fs = 1000.0 / dt_global
 
-        # 1. PSD Loss (targeting Gamma ~40Hz if labels reflect that)
-        def compute_psd_scaled(trace):
-            t_l, t_r = int(500/dt_global), int(1000/dt_global) # Stim window
-            signal_stim = jnp.mean(trace[:, t_l:t_r], axis=0)
-            _, psd = compute_psd(signal_stim, dt_global, target_freqs=global_psd_interval)
+        def compute_psd_scaled(trace, t_l, t_r):
+            signal = jnp.mean(trace[:, t_l:t_r], axis=0)
+            _, psd = compute_psd(signal, dt_global, target_freqs=global_psd_interval)
             return psd / (jnp.max(psd) + 1e-6)
 
-        predictions = jax.vmap(compute_psd_scaled)(traces)
-        psd_loss = jnp.mean(jnp.sum(jnp.square(labels * jnp.square(predictions - labels)), axis=1))
+        def get_trace_loss(trace, t_stim, t_off):
+            # PSDs
+            psd_pre = compute_psd_scaled(trace, int(100/dt_global), int(500/dt_global))
+            psd_stim = compute_psd_scaled(trace, int(500/dt_global), int(1000/dt_global))
+            psd_post = compute_psd_scaled(trace, int(1000/dt_global), int(1400/dt_global))
 
-        # 2. Kappa Minimization (Synchrony)
-        def get_kappa(trace):
-            # Binary spike matrix from trace
+            loss_pre = jnp.sum(jnp.square(t_off * jnp.square(psd_pre - t_off)))
+            loss_stim = jnp.sum(jnp.square(t_stim * jnp.square(psd_stim - t_stim)))
+            loss_post = jnp.sum(jnp.square(t_off * jnp.square(psd_post - t_off)))
+            
+            # Kappas
             threshold = -20.0
             spikes = (trace[:, :-1] < threshold) & (trace[:, 1:] >= threshold)
             spike_matrix = jnp.zeros_like(trace).at[:, 1:].set(spikes.astype(jnp.float32))
-            return compute_kappa(spike_matrix[:, int(500/dt_global):int(1000/dt_global)], fs)
+            
+            k_pre = compute_kappa(spike_matrix[:, int(100/dt_global):int(500/dt_global)], fs)
+            k_stim = compute_kappa(spike_matrix[:, int(500/dt_global):int(1000/dt_global)], fs)
+            k_post = compute_kappa(spike_matrix[:, int(1000/dt_global):int(1400/dt_global)], fs)
+            
+            kappa_total = jnp.abs(k_pre) + jnp.abs(k_stim) + jnp.abs(k_post)
+            psd_total = loss_pre + loss_stim + loss_post
+            
+            return psd_total, kappa_total
 
-        kappas = jax.vmap(get_kappa)(traces)
-        kappa_loss = jnp.mean(jnp.abs(kappas)) # Minimize absolute Kappa
+        batched_losses = jax.vmap(get_trace_loss)(traces, target_stim, target_off)
+        psd_loss = jnp.mean(batched_losses[0])
+        kappa_loss = jnp.mean(batched_losses[1])
 
         # 3. Firing Rate Penalty
         firing_rates = calculate_firing_rates(traces, dt_global)

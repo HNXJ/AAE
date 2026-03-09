@@ -5,6 +5,15 @@ import matplotlib.pyplot as plt
 from typing import Tuple, Optional, List
 from scipy import signal
 
+def traces_to_spike_matrix(traces: np.ndarray, threshold: float = -20.0) -> np.ndarray:
+    """Converts voltage traces to a binary spike matrix."""
+    num_neurons, num_steps = traces.shape
+    spike_matrix = np.zeros_like(traces)
+    for i in range(num_neurons):
+        spikes = (traces[i, :-1] < threshold) & (traces[i, 1:] >= threshold)
+        spike_matrix[i, 1:][spikes] = 1.0
+    return spike_matrix
+
 def detect_spikes(neuron_trace, threshold=-20.0):
     """Detects upward crossings of a threshold."""
     # Exclude first point if it's V_init
@@ -75,7 +84,8 @@ def compute_correlations(traces, pre_inds, post_inds):
 
 def calculate_mcdp(traces, ampa_pre_inds, ampa_post_inds, gaba_pre_inds, gaba_post_inds):
     """
-    Calculates normalized MCDP factors for all trainable parameters.
+    Calculates normalized Mutual-correlation dependent plasticity (MCDP) factors 
+    for all trainable parameters.
     """
     r_ampa = compute_correlations(traces, ampa_pre_inds, ampa_post_inds)
     r_gaba = compute_correlations(traces, gaba_pre_inds, gaba_post_inds)
