@@ -71,6 +71,24 @@ class GradedGABAa(jx.synapses.Synapse):
         return {"sGABAa": s + d_s * dt}
     def compute_current(self, states, pre_v, post_v, params): return params["gGABAa"] * states["sGABAa"] * (post_v - params["EGABAa"])
 
+class GradedGABAb(jx.synapses.Synapse):
+    """Graded slow Inhibitory Synapse (GABAb)."""
+    def __init__(self, g: float = 1.0, tauD_GABAb: Optional[float] = None):
+        super().__init__()
+        self.synapse_params = {
+            "gGABAb": g, "EGABAb": -95.0, "tauDGABAb": 200.0, "tauRGABAb": 10.0, 
+            "slopeGABAb": 5.0, "V_thGABAb": -20.0
+        }
+        if tauD_GABAb is not None: self.synapse_params["tauDGABAb"] = tauD_GABAb
+        self.synapse_states = {"sGABAb": 0.01}
+    def update_states(self, states, dt, pre_v, post_v, params):
+        s = states["sGABAb"]
+        activation = 0.5 * (1 + jnp.tanh((pre_v - params["V_thGABAb"]) / params["slopeGABAb"]))
+        d_s = (-s / params["tauDGABAb"]) + activation * ((1 - s) / params["tauRGABAb"])
+        return {"sGABAb": s + d_s * dt}
+    def compute_current(self, states, pre_v, post_v, params): 
+        return params["gGABAb"] * states["sGABAb"] * (post_v - params["EGABAb"])
+
 def build_net_eig(num_e: int, num_ig: int, num_il: int, seed: Optional[int] = None):
     """
     Constructs a JAXley neural network with specified numbers of excitatory and inhibitory neurons.
