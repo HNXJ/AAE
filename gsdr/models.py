@@ -137,3 +137,59 @@ def build_net_eig(num_e: int, num_ig: int, num_il: int, seed: Optional[int] = No
     fully_connect(pre_il, post_il, GradedGABAa(g=5.0, tauD_GABAa=5.0)) # Increased to 5.0ms
 
     return net
+
+
+def build_pyramidal_mc(seed=None):
+    """Multi-compartment Pyramidal cell (Soma + Distal Dendrite)."""
+    if seed is None: seed = 42
+    comp_soma = jx.Compartment()
+    comp_dend = jx.Compartment()
+    # Simple cable: Soma (0) -> Dendrite (1)
+    cell = jx.Cell([comp_soma, comp_dend], parents=[-1, 0])
+    cell.radius = 1.0
+    cell.length = 100.0 # Length drives axial resistance
+    return cell
+
+
+# --- Cell Models (Pyramidal, PV, SST, VIP) ---
+
+def build_pyramidal_cell():
+    """Regular Spiking (RS) Pyramidal Cell with adaptation."""
+    comp_soma = jx.Compartment()
+    comp_dend = jx.Compartment()
+    cell = jx.Cell([comp_soma, comp_dend], parents=[-1, 0])
+    cell.radius = 1.0
+    cell.length = 100.0
+    # High adaptation, standard HH
+    cell.insert(jx.channels.HH())
+    # Assuming Jaxley HH has gK, gNa, gl. 
+    # For RS: gK is moderate, gNa is moderate.
+    return cell
+
+def build_pv_cell():
+    """Fast Spiking (FS) Parvalbumin Interneuron."""
+    comp_soma = jx.Compartment()
+    cell = jx.Cell([comp_soma], parents=[-1])
+    cell.radius = 1.0
+    cell.length = 10.0
+    cell.insert(jx.channels.HH())
+    # FS typically has very high gNa and gK for fast repolarization
+    return cell
+
+def build_sst_cell():
+    """Low-Threshold Spiking (LTS) Somatostatin Interneuron."""
+    comp_soma = jx.Compartment()
+    cell = jx.Cell([comp_soma], parents=[-1])
+    cell.radius = 1.0
+    cell.length = 10.0
+    cell.insert(jx.channels.HH())
+    return cell
+
+def build_vip_cell():
+    """Irregular Spiking / Bursting VIP Interneuron."""
+    comp_soma = jx.Compartment()
+    cell = jx.Cell([comp_soma], parents=[-1])
+    cell.radius = 0.5 # Smaller size, lower capacitance
+    cell.length = 10.0
+    cell.insert(jx.channels.HH())
+    return cell
