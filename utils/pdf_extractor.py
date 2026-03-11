@@ -49,15 +49,14 @@ def extract_pdf_content(pdf_path, output_img_dir, output_txt_dir):
     doc.close()
 
 if __name__ == "__main__":
-    pdf_dir = "/Users/hamednejat/workspace/media/pdfs/"
-    img_dir = "/Users/hamednejat/workspace/media/pdfs/img/"
-    txt_dir = "/Users/hamednejat/workspace/media/pdfs/txt/"
+    pdf_dir = "/Users/hamednejat/workspace/Research_Assets/media/pdfs/"
+    img_dir = "/Users/hamednejat/workspace/Research_Assets/media/pdfs/img/"
+    txt_dir = "/Users/hamednejat/workspace/Research_Assets/media/pdfs/txt/"
     
-    pdfs = ["jaxley_paper_2025_nn.pdf", "Lichtenfeld2024N.pdf", "Scz_AM2025_ing.pdf"]
+    # Process all PDFs in the directory
+    import glob
+    pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
     
-    for pdf in pdfs:
-        full_path = os.path.join(pdf_dir, pdf)
-        if os.path.exists(full_path):
-            extract_pdf_content(full_path, img_dir, txt_dir)
-        else:
-            print(f"❌ File not found: {full_path}")
+    print(f"🔎 Found {len(pdf_files)} PDFs to process.")
+    for full_path in pdf_files:
+        extract_pdf_content(full_path, img_dir, txt_dir)
