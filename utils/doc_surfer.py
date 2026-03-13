@@ -1,73 +1,32 @@
+import os
 import sys
-import argparse
-import urllib.request
-from urllib.error import URLError
-import re
+from typing import List, Optional
 
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    print("BeautifulSoup not found. Please install: pip install beautifulsoup4")
-    sys.exit(1)
-
-def extract_content(url):
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'})
-        with urllib.request.urlopen(req) as response:
-            html = response.read()
-            
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # Try to find the main content area (standard for MkDocs/Sphinx/ReadTheDocs)
-        main_content = soup.find('main') or soup.find('article') or soup.find(role='main') or soup.find(class_='document') or soup.body
-        
-        if not main_content:
-            return "Could not find main content area."
-
-        # Remove irrelevant elements like sidebars, footers, scripts
-        for element in main_content(['nav', 'footer', 'script', 'style', 'header']):
-            element.decompose()
-
-        # Format code blocks nicely into markdown
-        for pre in main_content.find_all('pre'):
-            code_text = pre.get_text()
-            new_pre = soup.new_string(f"\n```python\n{code_text}\n```\n")
-            pre.replace_with(new_pre)
-
-        # Format headers into markdown
-        for h in main_content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-            level = int(h.name[1])
-            h_text = h.get_text().replace('¶', '').strip() # Remove common anchor links
-            new_h = soup.new_string(f"\n\n{'#' * level} {h_text}\n\n")
-            h.replace_with(new_h)
-            
-        # Get cleaned text
-        text = main_content.get_text(separator='\n')
-        
-        # Clean up excessive newlines
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        
-        return text.strip()
-        
-    except Exception as e:
-        return f"Error fetching {url}: {e}"
-
-def main():
-    parser = argparse.ArgumentParser(description="doc_surfer: Extract technical documentation into Markdown.")
-    parser.add_argument("url", help="URL of the documentation page")
-    parser.add_argument("-o", "--output", help="Output Markdown file", default=None)
-    args = parser.parse_args()
-
-    print(f"🌊 Surfing: {args.url}")
-    content = extract_content(args.url)
+def surf_documentation(urls: List[str], topic: str, context: Optional[str] = None):
+    """
+    Structured interface for systematic documentation analysis.
+    This function is designed to be called by Gemini CLI to extract high-signal
+    technical content for skill enrichment.
+    """
+    prompt = f"Topic: {topic}\n"
+    if context:
+        prompt += f"Context: {context}\n"
+    prompt += "Please analyze the following documentation URLs and extract: \n"
+    prompt += "1. Core API definitions and signatures.\n"
+    prompt += "2. Best practices and 'Programming Grammar' unique to this library.\n"
+    prompt += "3. Advanced features relevant to biophysical modeling and JAX optimization.\n"
+    prompt += "4. Code snippets following modular and PyTree-native patterns.\n\n"
+    prompt += "URLs:\n" + "\n".join(urls)
     
-    if args.output:
-        with open(args.output, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"✅ Saved to: {args.output}")
-    else:
-        print("\n--- Extracted Content ---\n")
-        print(content)
+    # In practice, Gemini CLI uses the web_fetch tool directly.
+    # This script serves as the 'grammar' for how to prompt that tool.
+    print("--- SURF PROMPT GENERATED ---")
+    print(prompt)
+    print("------------------------------")
+    return prompt
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 3:
+        print("Usage: python doc_surfer.py <topic> <url1> <url2> ...")
+    else:
+        surf_documentation(sys.argv[2:], sys.argv[1])
